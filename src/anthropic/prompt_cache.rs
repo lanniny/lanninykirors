@@ -21,16 +21,24 @@ use sha2::{Digest, Sha256};
 
 use crate::token;
 
+use super::converter::map_model;
 use super::types::{Message, MessagesRequest, SystemMessage};
 
 /// 缓存条目 TTL
-const PROMPT_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const PROMPT_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+/// 命中热条目时，间隔一段时间刷新一次时间戳，避免活跃缓存被当成旧条目淘汰。
+const PROMPT_CACHE_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 10);
 /// 内存中最多保留的 prompt cache 条目数
-const MAX_PROMPT_CACHE_ENTRIES: usize = 2048;
+const MAX_PROMPT_CACHE_ENTRIES: usize = 16_384;
 /// 大文本内部额外生成前缀断点时，至少要保留这么多 tokens，避免过短前缀污染缓存。
 const MIN_TEXT_PREFIX_TOKENS: u64 = 128;
+/// 当本地预估过小或与上游实际输入相差过大时，不放大 cache usage，避免把伪命中放大成大额命中。
+const MIN_ESTIMATED_INPUT_TOKENS_FOR_UPWARD_SCALING: i32 = 128;
+const MAX_UPWARD_USAGE_SCALE_FACTOR: f64 = 8.0;
 /// 对大文本内部做“近尾部”前缀采样，以便尾巴变化时依然能高命中。
-const TEXT_PREFIX_TAIL_DELTAS: &[u64] = &[32, 64, 128, 256, 512, 1024, 2048];
+const TEXT_PREFIX_TAIL_DELTAS: &[u64] = &[
+    16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
+];
 
 /// 模拟 prompt cache 统计
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,8 +62,39 @@ impl PromptCacheUsage {
     }
 
     pub fn with_actual_input_tokens(&self, input_tokens: i32) -> Self {
-        self.clone()
-            .with_billed_input_tokens(self.billed_input_tokens_for(input_tokens.max(1)))
+        let input_tokens = input_tokens.max(1);
+        let estimated_total_input_tokens =
+            (self.billed_input_tokens + self.cache_read_input_tokens).max(1);
+
+        if input_tokens <= estimated_total_input_tokens {
+            return self
+                .clone()
+                .with_billed_input_tokens(self.billed_input_tokens_for(input_tokens));
+        }
+
+        let scale = input_tokens as f64 / estimated_total_input_tokens as f64;
+        if self.cache_read_input_tokens <= 0
+            || estimated_total_input_tokens < MIN_ESTIMATED_INPUT_TOKENS_FOR_UPWARD_SCALING
+            || scale > MAX_UPWARD_USAGE_SCALE_FACTOR
+        {
+            return self
+                .clone()
+                .with_billed_input_tokens(self.billed_input_tokens_for(input_tokens));
+        }
+
+        let cache_read_input_tokens =
+            ((self.cache_read_input_tokens as f64) * scale).round() as i32;
+        let cache_creation_input_tokens =
+            ((self.cache_creation_input_tokens as f64) * scale).round() as i32;
+        let cache_read_input_tokens = cache_read_input_tokens.clamp(0, input_tokens);
+        let cache_creation_input_tokens = cache_creation_input_tokens
+            .clamp(0, input_tokens.saturating_sub(cache_read_input_tokens));
+
+        Self {
+            billed_input_tokens: (input_tokens - cache_read_input_tokens).max(1),
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        }
     }
 
     pub fn hit_rate_for(&self, input_tokens: i32) -> f64 {
@@ -220,12 +259,18 @@ impl PromptCache {
         let (longest_hit, longest_written, snapshot_to_persist) = {
             let mut entries = self.entries.lock();
             let mut changed = prune_expired(&mut entries);
+            let now = Utc::now().timestamp();
 
-            let longest_hit = candidates
-                .iter()
-                .rev()
-                .find_map(|candidate| entries.get(&candidate.key).map(|_| candidate.token_count))
-                .unwrap_or(0);
+            let mut longest_hit = 0;
+            for candidate in candidates.iter().rev() {
+                let Some(entry) = entries.get_mut(&candidate.key) else {
+                    continue;
+                };
+
+                longest_hit = candidate.token_count;
+                changed |= refresh_entry_timestamp_if_stale(entry, now);
+                break;
+            }
 
             let mut longest_written = longest_hit;
             for candidate in &candidates {
@@ -347,6 +392,15 @@ fn prune_expired(entries: &mut HashMap<String, PromptCacheEntry>) -> bool {
     before_len != entries.len()
 }
 
+fn refresh_entry_timestamp_if_stale(entry: &mut PromptCacheEntry, now: i64) -> bool {
+    if now - entry.cached_at < PROMPT_CACHE_TOUCH_INTERVAL.as_secs() as i64 {
+        return false;
+    }
+
+    entry.cached_at = now;
+    true
+}
+
 fn collect_candidates(req: &MessagesRequest) -> Vec<PromptCacheCandidate> {
     let mut candidates_by_key = HashMap::new();
 
@@ -466,8 +520,8 @@ fn build_candidate(
     messages: Vec<Message>,
 ) -> PromptCacheCandidate {
     let key_source = json!({
-        "scope": normalized_scope(req),
-        "model": req.model,
+        "scope": prompt_cache_scope(req),
+        "model": prompt_cache_model(req),
         "system": system,
         "messages": messages,
         "tools": req.tools,
@@ -543,7 +597,7 @@ fn apply_text_prefix(block: &mut Value, text_prefix: String) {
     }
 }
 
-fn normalized_scope(req: &MessagesRequest) -> String {
+pub(crate) fn prompt_cache_scope(req: &MessagesRequest) -> String {
     let Some(raw_user_id) = req
         .metadata
         .as_ref()
@@ -566,6 +620,10 @@ fn normalized_scope(req: &MessagesRequest) -> String {
     }
 
     raw_user_id.to_string()
+}
+
+pub(crate) fn prompt_cache_model(req: &MessagesRequest) -> String {
+    map_model(&req.model).unwrap_or_else(|| req.model.clone())
 }
 
 fn sha256_hex(input: &str) -> String {
@@ -815,6 +873,30 @@ mod tests {
     }
 
     #[test]
+    fn model_aliases_share_prompt_cache() {
+        let cache = PromptCache::default();
+        let mut req = base_request();
+        req.model = "claude-opus-4-7".to_string();
+        let base_input_tokens = token::count_all_tokens_local(
+            req.system.clone(),
+            req.messages.clone(),
+            req.tools.clone(),
+        ) as i32;
+        cache.resolve_usage(&req, base_input_tokens);
+
+        let mut alias_req = base_request();
+        alias_req.model = "claude-opus-4-6".to_string();
+
+        let usage = cache.resolve_usage(&alias_req, base_input_tokens);
+
+        assert!(
+            usage.cache_read_input_tokens > 0,
+            "expected alias model to reuse prompt cache, usage={usage:?}"
+        );
+        assert!(usage.billed_input_tokens < base_input_tokens);
+    }
+
+    #[test]
     fn automatic_prefix_cache_can_reach_over_ninety_percent_hit_rate() {
         let cache = PromptCache::default();
         let large_prefix = "稳定前缀上下文".repeat(500);
@@ -945,6 +1027,78 @@ mod tests {
     }
 
     #[test]
+    fn medium_text_with_mid_tail_edit_can_hit_over_sixty_percent() {
+        let cache = PromptCache::default();
+        let stable_prefix = "共享上下文".repeat(350);
+        let req1 = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(format!(
+                    "{stable_prefix}{}{}",
+                    "第一版扩展内容".repeat(120),
+                    "结尾问题 A"
+                )),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(
+                    "user_medium_tail__session_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                ),
+            }),
+        };
+        let req1_tokens = token::count_all_tokens_local(
+            req1.system.clone(),
+            req1.messages.clone(),
+            req1.tools.clone(),
+        ) as i32;
+        cache.resolve_usage(&req1, req1_tokens);
+
+        let req2 = MessagesRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(format!(
+                    "{stable_prefix}{}{}",
+                    "第二版扩展内容".repeat(120),
+                    "结尾问题 B"
+                )),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(
+                    "user_medium_tail__session_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ),
+            }),
+        };
+        let req2_tokens = token::count_all_tokens_local(
+            req2.system.clone(),
+            req2.messages.clone(),
+            req2.tools.clone(),
+        ) as i32;
+
+        let usage = cache.resolve_usage(&req2, req2_tokens);
+        let hit_rate = usage.cache_read_input_tokens as f64 / req2_tokens as f64;
+
+        assert!(
+            hit_rate > 0.6,
+            "medium tail edit hit_rate={hit_rate}, usage={usage:?}, req2_tokens={req2_tokens}"
+        );
+    }
+
+    #[test]
     fn cache_persists_to_disk_and_can_be_reloaded() {
         let cache_path = unique_test_cache_path("prompt_cache_persist");
         let _ = std::fs::remove_file(&cache_path);
@@ -999,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_input_tokens_only_updates_billed_tokens() {
+    fn actual_input_tokens_scales_cache_usage_upward() {
         let usage = PromptCacheUsage {
             billed_input_tokens: 900,
             cache_creation_input_tokens: 80,
@@ -1008,9 +1162,90 @@ mod tests {
 
         let scaled = usage.with_actual_input_tokens(2500);
 
+        assert_eq!(scaled.cache_read_input_tokens, 250);
+        assert_eq!(scaled.cache_creation_input_tokens, 200);
+        assert_eq!(scaled.billed_input_tokens, 2250);
+    }
+
+    #[test]
+    fn actual_input_tokens_does_not_scale_cache_usage_downward() {
+        let usage = PromptCacheUsage {
+            billed_input_tokens: 900,
+            cache_creation_input_tokens: 80,
+            cache_read_input_tokens: 100,
+        };
+
+        let scaled = usage.with_actual_input_tokens(500);
+
         assert_eq!(scaled.cache_read_input_tokens, 100);
         assert_eq!(scaled.cache_creation_input_tokens, 80);
-        assert_eq!(scaled.billed_input_tokens, 2400);
+        assert_eq!(scaled.billed_input_tokens, 400);
+    }
+
+    #[test]
+    fn actual_input_tokens_does_not_scale_tiny_estimates_upward() {
+        let usage = PromptCacheUsage {
+            billed_input_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1,
+        };
+
+        let scaled = usage.with_actual_input_tokens(2064);
+
+        assert_eq!(scaled.cache_read_input_tokens, 1);
+        assert_eq!(scaled.cache_creation_input_tokens, 0);
+        assert_eq!(scaled.billed_input_tokens, 2063);
+    }
+
+    #[test]
+    fn actual_input_tokens_does_not_scale_implausible_ratio_upward() {
+        let usage = PromptCacheUsage {
+            billed_input_tokens: 80,
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 160,
+        };
+
+        let scaled = usage.with_actual_input_tokens(5000);
+
+        assert_eq!(scaled.cache_read_input_tokens, 160);
+        assert_eq!(scaled.cache_creation_input_tokens, 20);
+        assert_eq!(scaled.billed_input_tokens, 4840);
+    }
+
+    #[test]
+    fn repeated_hit_refreshes_stale_cache_timestamp() {
+        let cache = PromptCache::default();
+        let req = base_request();
+        let base_input_tokens = token::count_all_tokens_local(
+            req.system.clone(),
+            req.messages.clone(),
+            req.tools.clone(),
+        ) as i32;
+        cache.resolve_usage(&req, base_input_tokens);
+
+        let longest_candidate = collect_candidates(&req)
+            .into_iter()
+            .max_by_key(|candidate| candidate.token_count)
+            .expect("should have prompt cache candidates");
+        let stale_cached_at =
+            Utc::now().timestamp() - PROMPT_CACHE_TOUCH_INTERVAL.as_secs() as i64 - 1;
+        {
+            let mut entries = cache.entries.lock();
+            let entry = entries
+                .get_mut(&longest_candidate.key)
+                .expect("candidate should be cached");
+            entry.cached_at = stale_cached_at;
+        }
+
+        cache.resolve_usage(&req, base_input_tokens);
+
+        let refreshed_cached_at = cache
+            .entries
+            .lock()
+            .get(&longest_candidate.key)
+            .expect("candidate should still exist")
+            .cached_at;
+        assert!(refreshed_cached_at > stale_cached_at);
     }
 
     fn unique_test_cache_path(prefix: &str) -> PathBuf {

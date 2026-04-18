@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::prompt_cache::PromptCacheUsage;
+use super::prompt_cache::{PromptCacheUsage, prompt_cache_model, prompt_cache_scope};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -190,6 +190,16 @@ pub async fn post_messages(
         cache_creation_input_tokens = prompt_cache_usage.cache_creation_input_tokens,
         cache_hit_rate = format_args!("{:.2}%", prompt_cache_usage.hit_rate_for(estimated_input_tokens) * 100.0),
         "Prompt cache evaluated"
+    );
+    tracing::info!(
+        requested_model = %payload.model,
+        cache_model = %prompt_cache_model(&payload),
+        cache_scope = %prompt_cache_scope(&payload),
+        estimated_input_tokens = estimated_input_tokens,
+        billed_input_tokens = prompt_cache_usage.billed_input_tokens,
+        cache_read_input_tokens = prompt_cache_usage.cache_read_input_tokens,
+        cache_creation_input_tokens = prompt_cache_usage.cache_creation_input_tokens,
+        "Prompt cache preflight"
     );
 
     // 检查是否为 WebSearch 请求
@@ -591,6 +601,17 @@ async fn handle_non_stream_request(
     let final_prompt_cache_usage = prompt_cache_usage.with_actual_input_tokens(final_input_tokens);
 
     // 构建 Anthropic 响应
+    tracing::info!(
+        requested_model = %model,
+        estimated_input_tokens = input_tokens,
+        upstream_input_tokens = final_input_tokens,
+        billed_input_tokens = final_prompt_cache_usage.billed_input_tokens,
+        cache_read_input_tokens = final_prompt_cache_usage.cache_read_input_tokens,
+        cache_creation_input_tokens = final_prompt_cache_usage.cache_creation_input_tokens,
+        output_tokens = output_tokens,
+        "Prompt cache final usage"
+    );
+
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -721,6 +742,16 @@ pub async fn post_messages_cc(
         cache_creation_input_tokens = prompt_cache_usage.cache_creation_input_tokens,
         cache_hit_rate = format_args!("{:.2}%", prompt_cache_usage.hit_rate_for(estimated_input_tokens) * 100.0),
         "Prompt cache evaluated"
+    );
+    tracing::info!(
+        requested_model = %payload.model,
+        cache_model = %prompt_cache_model(&payload),
+        cache_scope = %prompt_cache_scope(&payload),
+        estimated_input_tokens = estimated_input_tokens,
+        billed_input_tokens = prompt_cache_usage.billed_input_tokens,
+        cache_read_input_tokens = prompt_cache_usage.cache_read_input_tokens,
+        cache_creation_input_tokens = prompt_cache_usage.cache_creation_input_tokens,
+        "Prompt cache preflight"
     );
 
     // 检查是否为 WebSearch 请求

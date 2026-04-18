@@ -1134,6 +1134,16 @@ impl StreamContext {
             .with_actual_input_tokens(raw_input_tokens);
         let final_input_tokens = final_prompt_cache_usage.billed_input_tokens;
 
+        tracing::info!(
+            requested_model = %self.model,
+            upstream_input_tokens = raw_input_tokens,
+            billed_input_tokens = final_prompt_cache_usage.billed_input_tokens,
+            cache_read_input_tokens = final_prompt_cache_usage.cache_read_input_tokens,
+            cache_creation_input_tokens = final_prompt_cache_usage.cache_creation_input_tokens,
+            output_tokens = self.output_tokens,
+            "Prompt cache final usage"
+        );
+
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
