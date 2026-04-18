@@ -25,6 +25,7 @@
 mod converter;
 mod handlers;
 mod middleware;
+mod prompt_cache;
 mod router;
 mod stream;
 pub mod types;

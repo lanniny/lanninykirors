@@ -184,7 +184,7 @@ async fn call_remote_count_tokens(
 }
 
 /// 本地计算请求的输入 tokens
-fn count_all_tokens_local(
+pub(crate) fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
     tools: Option<Vec<Tool>>,

@@ -41,6 +41,7 @@
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
+- **模拟 Prompt Cache**: 支持自动前缀缓存、跨 session 复用和持久化恢复
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
@@ -66,6 +67,7 @@
   - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
   - [Thinking 模式](#thinking-模式)
   - [工具调用](#工具调用)
+- [Prompt Cache](#prompt-cache)
 - [模型映射](#模型映射)
 - [Admin（可选）](#admin可选)
 - [注意事项](#注意事项)
@@ -432,6 +434,21 @@ RUST_LOG=debug ./target/release/kiro-rs
   "messages": [...]
 }
 ```
+
+## Prompt Cache
+
+服务内置了一套 Anthropic 兼容层的模拟 Prompt Cache，目标是让“长而稳定的上下文前缀”在后续请求中尽量高命中：
+
+- 自动为 `system`、历史消息、内容块前缀建立缓存断点
+- 同一账号下不同 session 默认可以复用缓存前缀
+- 响应 `usage` 中会返回：
+  - `cache_creation_input_tokens`
+  - `cache_read_input_tokens`
+- `input_tokens` 会按缓存读取量扣减后返回
+
+缓存默认会持久化到凭据目录下的 `anthropic_prompt_cache.json`，服务重启后仍然可以继续命中。
+
+如果请求的大部分前缀稳定、变化主要集中在尾部问题或最新一轮用户输入，通常可以获得更高的缓存命中率。
 
 ## 模型映射
 

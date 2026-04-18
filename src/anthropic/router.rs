@@ -1,5 +1,7 @@
 //! Anthropic API 路由配置
 
+use std::path::PathBuf;
+
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -38,8 +40,9 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    prompt_cache_path: Option<PathBuf>,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_key, extract_thinking, prompt_cache_path);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

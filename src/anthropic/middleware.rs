@@ -1,5 +1,6 @@
 //! Anthropic API 中间件
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -13,6 +14,7 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::prompt_cache::PromptCache;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -25,15 +27,22 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 本地模拟 prompt cache
+    pub prompt_cache: Arc<PromptCache>,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        prompt_cache_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            prompt_cache: Arc::new(PromptCache::new(prompt_cache_path)),
         }
     }
 

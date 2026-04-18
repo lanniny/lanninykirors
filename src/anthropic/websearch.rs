@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::prompt_cache::PromptCacheUsage;
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
@@ -219,10 +220,15 @@ pub fn create_websearch_sse_stream(
     query: String,
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
-    input_tokens: i32,
+    prompt_cache_usage: PromptCacheUsage,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        prompt_cache_usage,
+    );
 
     stream::iter(
         events
@@ -237,7 +243,7 @@ fn generate_websearch_events(
     query: &str,
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
-    input_tokens: i32,
+    prompt_cache_usage: PromptCacheUsage,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -258,10 +264,10 @@ fn generate_websearch_events(
                 "content": [],
                 "stop_reason": null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": prompt_cache_usage.billed_input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": prompt_cache_usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": prompt_cache_usage.cache_read_input_tokens
                 }
             }
         }),
@@ -425,7 +431,10 @@ fn generate_websearch_events(
                 "stop_reason": "end_turn"
             },
             "usage": {
+                "input_tokens": prompt_cache_usage.billed_input_tokens,
                 "output_tokens": output_tokens,
+                "cache_creation_input_tokens": prompt_cache_usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": prompt_cache_usage.cache_read_input_tokens,
                 "server_tool_use": {
                     "web_search_requests": 1
                 }
@@ -474,7 +483,7 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
-    input_tokens: i32,
+    prompt_cache_usage: PromptCacheUsage,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -507,8 +516,13 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        prompt_cache_usage,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
